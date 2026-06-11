@@ -1,5 +1,9 @@
 venv/
 __pycache__/
 *.pyc
-vectorstore/
+
+data/chroma/
+data/uploads/
+data/processed/
+
 .env
