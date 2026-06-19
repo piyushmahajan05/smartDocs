@@ -8,12 +8,17 @@ Handles PDF ingestion for SmartDocs AI:
   - Returns extraction metadata (pages, character count)
 """
 
-from pathlib import Path
 from dataclasses import dataclass
+from pathlib import Path
 
 import fitz  # PyMuPDF
 
-from app.services.utils import sanitize_filename, ensure_directories
+from app.services.utils import (
+    ensure_directories,
+    sanitize_filename,
+    write_unique_bytes,
+    write_unique_text,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -47,13 +52,13 @@ def save_pdf(file_bytes: bytes, original_filename: str) -> Path:
     ensure_directories(UPLOADS_DIR)
 
     safe_name = sanitize_filename(original_filename)
-    destination = UPLOADS_DIR / safe_name
+    if not safe_name:
+        raise ValueError("Invalid filename provided for uploaded PDF.")
 
-    destination.write_bytes(file_bytes)
-    return destination
+    return write_unique_bytes(UPLOADS_DIR, safe_name, file_bytes)
 
 
-def extract_text_from_pdf(pdf_path: Path) -> tuple[str, int]:
+def extract_text_from_pdf(pdf_path: Path) -> tuple[str, int, int]:
     """
     Open a PDF with PyMuPDF and extract text from every page.
 
@@ -61,28 +66,49 @@ def extract_text_from_pdf(pdf_path: Path) -> tuple[str, int]:
         pdf_path: Path to the PDF file on disk.
 
     Returns:
-        A tuple of (full_text, page_count).
+        A tuple of (full_text, page_count, character_count).
 
     Raises:
         ValueError: If the file cannot be opened as a valid PDF.
     """
     try:
-        document = fitz.open(str(pdf_path))
+        file_bytes = pdf_path.read_bytes()
     except Exception as exc:
-        raise ValueError(f"Unable to open PDF '{pdf_path.name}': {exc}") from exc
+        raise ValueError(f"Unable to read PDF '{pdf_path.name}': {exc}") from exc
+
+    return extract_text_from_pdf_bytes(file_bytes=file_bytes, source_name=pdf_path.name)
+
+
+def extract_text_from_pdf_bytes(file_bytes: bytes, source_name: str) -> tuple[str, int, int]:
+    """
+    Open a PDF from bytes with PyMuPDF and extract text from every page.
+
+    Args:
+        file_bytes: Raw bytes of the PDF document.
+        source_name: Human-readable name used in error messages.
+
+    Returns:
+        A tuple of (full_text, page_count, character_count).
+    """
+    try:
+        document = fitz.open(stream=file_bytes, filetype="pdf")
+    except Exception as exc:
+        raise ValueError(f"Unable to open PDF '{source_name}': {exc}") from exc
 
     page_texts: list[str] = []
 
-    for page_number in range(len(document)):
-        page = document.load_page(page_number)
-        # get_text("text") returns plain text; preserves newlines within a page
-        page_text = page.get_text("text")
-        page_texts.append(page_text)
-
-    document.close()
+    try:
+        for page_number in range(len(document)):
+            page = document.load_page(page_number)
+            # get_text("text") returns plain text; preserves newlines within a page
+            page_text = page.get_text("text")
+            page_texts.append(page_text)
+    finally:
+        document.close()
 
     full_text = "\n".join(page_texts)
-    return full_text, len(page_texts)
+    character_count = sum(len(page_text) for page_text in page_texts)
+    return full_text, len(page_texts), character_count
 
 
 def save_extracted_text(text: str, original_filename: str) -> Path:
@@ -99,13 +125,13 @@ def save_extracted_text(text: str, original_filename: str) -> Path:
     ensure_directories(PROCESSED_DIR)
 
     safe_name = sanitize_filename(original_filename)
+    if not safe_name:
+        raise ValueError("Invalid filename provided for extracted text output.")
+
     # Replace the PDF extension (or whatever it has) with .txt
     stem = Path(safe_name).stem
     txt_filename = f"{stem}.txt"
-    destination = PROCESSED_DIR / txt_filename
-
-    destination.write_text(text, encoding="utf-8")
-    return destination
+    return write_unique_text(PROCESSED_DIR, txt_filename, text)
 
 
 def ingest_pdf(file_bytes: bytes, original_filename: str) -> IngestionResult:
@@ -126,18 +152,31 @@ def ingest_pdf(file_bytes: bytes, original_filename: str) -> IngestionResult:
     Raises:
         ValueError: Propagated from extract_text_from_pdf on invalid PDFs.
     """
-    # Step 1 — persist raw PDF
-    pdf_path = save_pdf(file_bytes, original_filename)
+    pdf_path: Path | None = None
+    txt_path: Path | None = None
 
-    # Step 2 — extract text
-    full_text, page_count = extract_text_from_pdf(pdf_path)
+    # Step 1 — validate and extract from bytes before persisting anything.
+    full_text, page_count, character_count = extract_text_from_pdf_bytes(
+        file_bytes=file_bytes,
+        source_name=original_filename,
+    )
 
-    # Step 3 — persist extracted text
-    txt_path = save_extracted_text(full_text, original_filename)
+    try:
+        # Step 2 — persist raw PDF
+        pdf_path = save_pdf(file_bytes, original_filename)
+
+        # Step 3 — persist extracted text
+        txt_path = save_extracted_text(full_text, original_filename)
+    except Exception:
+        if txt_path is not None and txt_path.exists():
+            txt_path.unlink(missing_ok=True)
+        if pdf_path is not None and pdf_path.exists():
+            pdf_path.unlink(missing_ok=True)
+        raise
 
     return IngestionResult(
         filename=original_filename,
         pages=page_count,
-        characters=len(full_text),
+        characters=character_count,
         processed_file=txt_path.name,
     )

@@ -5,14 +5,21 @@ SmartDocs AI — FastAPI application entry point.
 Registers all routes and configures the app instance.
 """
 
-from fastapi import FastAPI, File, UploadFile, HTTPException
+import logging
+
+from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import JSONResponse
 
 from app.ingestion.ingest import ingest_pdf
 
+logger = logging.getLogger(__name__)
+
+MAX_UPLOAD_BYTES = 25 * 1024 * 1024  # 25 MiB
+UPLOAD_READ_CHUNK_SIZE = 1024 * 1024  # 1 MiB
+
 app = FastAPI(
     title="SmartDocs AI",
-    description="Enterprise-style RAG system — local, no paid APIs.",
+    description="Enterprise-style RAG system",
     version="0.1.0",
 )
 
@@ -55,23 +62,37 @@ async def upload_pdf(file: UploadFile = File(...)) -> JSONResponse:
             detail="Unsupported file type. Please upload a PDF (.pdf) file.",
         )
 
-    # --- Read file bytes ----------------------------------------------------
-    file_bytes = await file.read()
+    # --- Read file bytes with an upper bound -------------------------------
+    file_bytes = bytearray()
+
+    while True:
+        chunk = await file.read(UPLOAD_READ_CHUNK_SIZE)
+        if not chunk:
+            break
+
+        if len(file_bytes) + len(chunk) > MAX_UPLOAD_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail="Uploaded file is too large. Maximum size is 25 MB.",
+            )
+
+        file_bytes.extend(chunk)
 
     if not file_bytes:
         raise HTTPException(status_code=400, detail="Uploaded file is empty.")
 
     # --- Run ingestion pipeline ---------------------------------------------
     try:
-        result = ingest_pdf(file_bytes=file_bytes, original_filename=filename)
+        result = ingest_pdf(file_bytes=bytes(file_bytes), original_filename=filename)
     except ValueError as exc:
         # ingest_pdf raises ValueError for corrupt / unreadable PDFs
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except Exception as exc:
-        # Catch-all for unexpected I/O errors
+        # Catch-all for unexpected I/O errors; keep client response generic.
+        logger.exception("Unexpected error during PDF ingestion")
         raise HTTPException(
             status_code=500,
-            detail=f"Internal error during ingestion: {exc}",
+            detail="Internal error during ingestion.",
         ) from exc
 
     return JSONResponse(
